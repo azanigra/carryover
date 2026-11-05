@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# carryover — Move your Omarchy setup to a new machine.
+#
+#   carryover backup  /run/media/$USER/DISK
+#   carryover restore /run/media/$USER/DISK/carryover-<host>-<date>
+#
+# The approach: install Omarchy fresh on the new machine, then bring over your
+# home folder, your package list and your saved Wi-Fi networks. The operating
+# system itself is never copied: disk encryption, bootloader and drivers depend
+# on the hardware, and a clean install sets them up right.
+#
+# Messages follow the system language (Spanish or English).
+#
+# Unofficial; not affiliated with the Omarchy project.
+# Copyright (c) 2026 Pablo Barrera — MIT License (see LICENSE).
+
+set -euo pipefail
+
+VERSION=0.1.0
+
+# ---------------------------------------------------------------------------
+# Language and output helpers
+
+LOCALE=${LC_ALL:-${LC_MESSAGES:-${LANG:-en}}}
+[[ $LOCALE == es* ]] && ES=1 || ES=0
+
+# m "English text" "Texto en español"  → prints the one for the current language
+m() { if (( ES )); then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+
+red()    { printf '\e[31m%s\e[0m\n' "$*"; }
+yellow() { printf '\e[33m%s\e[0m\n' "$*"; }
+green()  { printf '\e[32m%s\e[0m\n' "$*"; }
+step()   { printf '\n\e[1;34m==> %s\e[0m\n' "$*"; }
+die()    { red "$*"; exit 1; }
+
+# confirm "Question?" → true only on an explicit yes (y/s)
+confirm() {
+  local r
+  read -rp "$1 $(m '[y/N]' '[s/N]') " r || return 1
+  [[ ${r,,} == y* || ${r,,} == s* ]]
+}
+
+usage() {
+  if (( ES )); then
+    cat <<EOF
+carryover $VERSION — lleva tu Omarchy a una máquina nueva
+
+Uso:
+  carryover backup  <disco>       Respalda esta máquina en un disco externo
+  carryover restore <respaldo>    Restaura un respaldo en una Omarchy recién instalada
+  carryover --version
+
+Ejemplo:
+  carryover backup  /run/media/\$USER/MI_DISCO
+  carryover restore /run/media/\$USER/MI_DISCO/carryover-equipo-2026-11-05_1830
+EOF
+  else
+    cat <<EOF
+carryover $VERSION — move your Omarchy setup to a new machine
+
+Usage:
+  carryover backup  <disk>        Back up this machine to an external disk
+  carryover restore <backup>      Restore a backup onto a fresh Omarchy install
+  carryover --version
+
+Example:
+  carryover backup  /run/media/\$USER/MY_DISK
+  carryover restore /run/media/\$USER/MY_DISK/carryover-myhost-2026-11-05_1830
+EOF
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# backup
+
+# Files and folders in $HOME that are not worth carrying over.
+HOME_EXCLUDES=(
+  ./.cache
+  ./.local/share/Trash
+)
+
+# System paths with saved Wi-Fi networks (NetworkManager and iwd).
+WIFI_PATHS=(
+  etc/NetworkManager/system-connections
+  var/lib/iwd
+)
+
+cmd_backup() {
+  [[ $# -eq 1 ]] || { usage; exit 1; }
+
+  local dest_base dest host total skip needed free
+  dest_base=$(realpath "$1")
+  [[ -d $dest_base && -w $dest_base ]] \
+    || die "$(m "Does not exist or is not writable: $dest_base" "No existe o no puedo escribir en: $dest_base")"
+  case "$dest_base/" in
+    "$HOME"/*) die "$(m 'The destination is inside your home; use an external disk.' 'El destino está dentro de tu home; usa un disco externo.')" ;;
+  esac
+
+  host=$(hostnamectl hostname 2>/dev/null || hostname)
+  dest="$dest_base/carryover-$host-$(date +%F_%H%M)"
+
+  step "$(m 'Checking free space' 'Comprobando espacio')"
+  total=$(du -sk "$HOME" 2>/dev/null | awk '{print $1}' || true)
+  skip=$(cd "$HOME" && du -skc "${HOME_EXCLUDES[@]}" 2>/dev/null | awk 'END{print $1}' || true)
+  needed=$(( ${total:-0} - ${skip:-0} ))
+  free=$(df -Pk "$dest_base" | awk 'NR==2{print $4}')
+  echo "$(m 'Home to back up' 'Home a respaldar'): $(( needed / 1024 / 1024 )) GB $(m '(uncompressed)' '(sin comprimir)') · $(m 'Free on destination' 'Libre en destino'): $(( free / 1024 / 1024 )) GB"
+  (( free > needed )) || die "$(m 'Not enough space on the destination.' 'No hay espacio suficiente en el destino.')"
+
+  mkdir -p "$dest"
+  echo "$(m 'Backup folder' 'Carpeta del respaldo'): $dest"
+
+  step "$(m 'Machine info' 'Información del equipo')"
+  {
+    echo "carryover: $VERSION"
+    echo "host:      $host"
+    echo "user:      $USER (uid $(id -u))"
+    echo "date:      $(date --iso-8601=seconds)"
+    echo "omarchy:   $(omarchy-version 2>/dev/null || echo unknown)"
+    echo "kernel:    $(uname -r)"
+  } | tee "$dest/info.txt"
+
+  step "$(m 'Package lists' 'Listas de paquetes')"
+  pacman -Qqen > "$dest/packages-repo.txt"
+  pacman -Qqem > "$dest/packages-foreign.txt"
+  echo "$(wc -l < "$dest/packages-repo.txt") $(m 'from official repos' 'de repositorios oficiales') · $(wc -l < "$dest/packages-foreign.txt") $(m 'from AUR or built locally' 'de AUR o compilados localmente')"
+
+  step "$(m 'System settings (/etc and Wi-Fi)' 'Configuración del sistema (/etc y Wi-Fi)')"
+  pacman -Qii 2>/dev/null | awk '/^MODIFIED/{print $2}' > "$dest/etc-modified.txt"
+  echo "$(wc -l < "$dest/etc-modified.txt") $(m 'modified files in /etc' 'archivos de /etc modificados')"
+
+  local system=() f d
+  while IFS= read -r f; do [[ -n $f ]] && system+=("${f#/}"); done < "$dest/etc-modified.txt"
+  for d in "${WIFI_PATHS[@]}"; do
+    sudo test -d "/$d" && system+=("$d")
+  done
+  if (( ${#system[@]} )); then
+    echo "$(m 'Your password is needed to read root-owned files (saved Wi-Fi networks).' 'Se necesita tu contraseña para leer archivos de root (redes Wi-Fi guardadas).')"
+    sudo tar --acls --xattrs -C / -cpf - "${system[@]}" | zstd -q -T0 -o "$dest/system.tar.zst"
+    sudo -k
+  fi
+
+  step "$(m 'Your home folder (this takes a while)' 'Tu carpeta personal (esto tarda)')"
+  local excludes=()
+  for f in "${HOME_EXCLUDES[@]}"; do excludes+=(--exclude="$f"); done
+  tar --acls --xattrs "${excludes[@]}" -C "$HOME" -cpf - . \
+    | zstd -q -T0 -3 --progress -o "$dest/home.tar.zst"
+
+  step "$(m 'Checksums' 'Sumas de verificación')"
+  ( cd "$dest" && sha256sum -- *.tar.zst *.txt > SHA256SUMS )
+
+  step "$(m 'Done' 'Listo')"
+  du -sh "$dest"
+  green "$(m 'Backup complete' 'Respaldo completo'): $dest"
+  echo "$(m "Tip: copy carryover itself to the disk too, and unmount it before unplugging (udisksctl unmount)." "Consejo: copia también carryover al disco y desmóntalo antes de desconectarlo (udisksctl unmount).")"
+}
+
+# ---------------------------------------------------------------------------
+# restore
+
+cmd_restore() {
+  [[ $# -eq 1 ]] || { usage; exit 1; }
+
+  local src
+  src=$(realpath "$1")
+  [[ -f $src/info.txt && -f $src/home.tar.zst && -f $src/SHA256SUMS ]] \
+    || die "$(m "This does not look like a carryover backup: $src" "Esto no parece un respaldo de carryover: $src")"
+
+  step "$(m 'Verifying the backup' 'Verificando el respaldo')"
+  ( cd "$src" && sha256sum --quiet -c SHA256SUMS ) \
+    || die "$(m 'The backup is damaged. Stopping here.' 'El respaldo está dañado. Me detengo aquí.')"
+  green "$(m 'All files intact.' 'Archivos íntegros.')"
+  cat "$src/info.txt"
+
+  local old_user old_omarchy now_omarchy
+  old_user=$(awk '/^user:/{print $2}' "$src/info.txt")
+  old_omarchy=$(awk '/^omarchy:/{print $2}' "$src/info.txt")
+  now_omarchy=$(omarchy-version 2>/dev/null || echo unknown)
+
+  if [[ $old_user != "$USER" ]]; then
+    yellow "$(m "Heads up: the backup belongs to user '$old_user' and you are '$USER'." "Ojo: el respaldo es del usuario '$old_user' y tú eres '$USER'.")"
+    yellow "$(m "Some settings contain hard-coded /home/$old_user paths." "Algunas configuraciones traen rutas /home/$old_user escritas a mano.")"
+    confirm "$(m 'Continue anyway?' '¿Seguir de todos modos?')" || exit 1
+  fi
+  if [[ $old_omarchy != "$now_omarchy" ]]; then
+    yellow "$(m "Different Omarchy versions: backup $old_omarchy, this machine $now_omarchy." "Versión de Omarchy distinta: respaldo $old_omarchy, este equipo $now_omarchy.")"
+    yellow "$(m 'Ideally run omarchy-update on both machines first.' 'Lo ideal es correr omarchy-update en ambas máquinas antes.')"
+    confirm "$(m 'Continue anyway?' '¿Seguir de todos modos?')" || exit 1
+  fi
+
+  # 1. Official repo packages -------------------------------------------------
+  step "1/4 $(m 'Packages from the official repos' 'Paquetes de los repositorios oficiales')"
+  # Globals on purpose: the EXIT trap runs after this function's locals are gone.
+  available=$(mktemp); wanted=$(mktemp); missing=$(mktemp); installable=$(mktemp)
+  trap 'rm -f "$available" "$wanted" "$missing" "$installable"' EXIT
+  pacman -Slq | sort -u > "$available"
+  sort -u "$src/packages-repo.txt" > "$wanted"
+  comm -23 "$wanted" "$available" > "$missing"
+  comm -12 "$wanted" "$available" > "$installable"
+  if [[ -s $missing ]]; then
+    yellow "$(m 'No longer in the repos (skipped):' 'Ya no existen en los repositorios (se omiten):')"
+    sed 's/^/  - /' "$missing"
+  fi
+  if [[ -s $installable ]] && confirm "$(m "Install $(wc -l < "$installable") packages?" "¿Instalar $(wc -l < "$installable") paquetes?")"; then
+    sudo pacman -S --needed - < "$installable"
+  fi
+
+  # 2. AUR and locally built packages ----------------------------------------
+  step "2/4 $(m 'AUR and locally built packages' 'Paquetes de AUR y compilados localmente')"
+  local local_pkgs=() aur_pkgs=() p
+  if [[ -s $src/packages-foreign.txt ]]; then
+    while IFS= read -r p; do
+      [[ -z $p ]] && continue
+      if yay -Si --aur "$p" &>/dev/null; then aur_pkgs+=("$p"); else local_pkgs+=("$p"); fi
+    done < "$src/packages-foreign.txt"
+    if (( ${#aur_pkgs[@]} )) && confirm "$(m "Install ${#aur_pkgs[@]} AUR packages with yay?" "¿Instalar ${#aur_pkgs[@]} paquetes de AUR con yay?")"; then
+      yay -S --needed "${aur_pkgs[@]}"
+    fi
+  fi
+
+  # 3. Home folder ------------------------------------------------------------
+  step "3/4 $(m 'Your home folder' 'Tu carpeta personal')"
+  echo "$(m 'Files from the backup overwrite the ones in your home; nothing else is deleted.' 'Los archivos del respaldo reemplazan a los de tu home; no se borra nada más.')"
+  echo "$(m 'Your current ~/.config is saved first as ~/.config.before-carryover-<date>.' 'Tu ~/.config actual se guarda antes como ~/.config.before-carryover-<fecha>.')"
+  if confirm "$(m 'Restore home?' '¿Restaurar home?')"; then
+    [[ -d $HOME/.config ]] && cp -a "$HOME/.config" "$HOME/.config.before-carryover-$(date +%F_%H%M)"
+    zstd -dc "$src/home.tar.zst" | tar --acls --xattrs -C "$HOME" -xpf -
+    green "$(m 'Home restored.' 'Home restaurado.')"
+  fi
+
+  # 4. Wi-Fi and /etc ---------------------------------------------------------
+  step "4/4 $(m 'System: Wi-Fi and /etc' 'Sistema: Wi-Fi y /etc')"
+  if [[ -f $src/system.tar.zst ]]; then
+    if confirm "$(m 'Restore saved Wi-Fi networks?' '¿Restaurar las redes Wi-Fi guardadas?')"; then
+      local patterns=()
+      for d in "${WIFI_PATHS[@]}"; do patterns+=("$d*"); done
+      zstd -dc "$src/system.tar.zst" \
+        | sudo tar --acls --xattrs -C / -xpf - --wildcards "${patterns[@]}" 2>/dev/null || true
+      sudo systemctl try-restart NetworkManager iwd 2>/dev/null || true
+    fi
+  fi
+  if [[ -s $src/etc-modified.txt ]]; then
+    yellow "$(m 'carryover does not restore /etc blindly: new hardware may need different values.' 'carryover no restaura /etc a ciegas: el hardware nuevo puede necesitar otros valores.')"
+    echo "$(m 'Files you changed on the old machine:' 'Archivos que cambiaste en la máquina vieja:')"
+    sed 's/^/  /' "$src/etc-modified.txt"
+    echo "$(m 'To view one' 'Para ver uno'):  zstd -dc '$src/system.tar.zst' | tar -xOf - etc/FILE"
+  fi
+
+  step "$(m 'Done' 'Listo')"
+  if (( ${#local_pkgs[@]} )); then
+    yellow "$(m 'These packages are not on AUR; you built them. Rebuild them from their PKGBUILD (makepkg -si):' 'Estos paquetes no están en AUR; los compilaste tú. Reconstrúyelos desde su PKGBUILD (makepkg -si):')"
+    printf '  - %s\n' "${local_pkgs[@]}"
+  fi
+  green "$(m 'Reboot so everything loads with your settings.' 'Reinicia para que todo cargue con tu configuración.')"
+}
+
+# ---------------------------------------------------------------------------
+
+[[ $EUID -eq 0 ]] && die "$(m 'Do not run with sudo; carryover asks for your password when needed.' 'No lo corras con sudo; carryover pide la contraseña cuando la necesita.')"
+
+case ${1:-} in
+  backup)        shift; cmd_backup "$@" ;;
+  restore)       shift; cmd_restore "$@" ;;
+  --version|-V)  echo "carryover $VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *)             usage; exit 1 ;;
+esac

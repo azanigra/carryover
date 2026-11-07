@@ -21,6 +21,7 @@ Un malentendido común: `omarchy-snapshot` **no** es un respaldo. Sus instantán
 | `packages-foreign.txt` | Paquetes de AUR y los que compilaste tú | Los de AUR se instalan con `yay`; los locales se listan para reconstruir |
 | `system.tar.zst` | Redes Wi-Fi guardadas y archivos de `/etc` que modificaste | Wi-Fi se restaura; `/etc` solo se muestra, nunca se aplica a ciegas |
 | `info.txt`, `SHA256SUMS` | Equipo, usuario, fecha, versión de Omarchy; sumas | Para avisar de diferencias y rechazar respaldos dañados |
+| `home-warnings.txt` | Solo si algunos archivos no se pudieron leer: cuáles quedaron fuera | Solo para que lo revises |
 
 Usa `tar` + `zstd` en vez de `rsync` directo, así los permisos, enlaces y ACL sobreviven aunque el USB esté en exFAT o NTFS.
 

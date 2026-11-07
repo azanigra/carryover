@@ -21,6 +21,7 @@ Also worth knowing: `omarchy-snapshot` is **not** a backup. Its snapper snapshot
 | `packages-foreign.txt` | AUR packages and ones you built yourself | AUR ones installed with `yay`; local builds listed for you to rebuild |
 | `system.tar.zst` | Saved Wi-Fi networks and the `/etc` files you modified | Wi-Fi restored; `/etc` only shown, never applied blindly |
 | `info.txt`, `SHA256SUMS` | Host, user, date, Omarchy version; checksums | Used to warn about mismatches and refuse damaged backups |
+| `home-warnings.txt` | Only if some files could not be read: which ones were left out | Just for you to check |
 
 It uses `tar` + `zstd` rather than plain `rsync`, so permissions, symlinks and ACLs survive even on an exFAT or NTFS USB disk.
 

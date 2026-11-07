@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION=0.1.0
+VERSION=0.1.1
 
 # ---------------------------------------------------------------------------
 # Language and output helpers
@@ -132,7 +132,8 @@ cmd_backup() {
   local system=() f d
   while IFS= read -r f; do [[ -n $f ]] && system+=("${f#/}"); done < "$dest/etc-modified.txt"
   for d in "${WIFI_PATHS[@]}"; do
-    sudo test -d "/$d" && system+=("$d")
+    # An if, not &&: under set -e a false test as the loop's last command would end the script.
+    if sudo test -d "/$d"; then system+=("$d"); fi
   done
   if (( ${#system[@]} )); then
     echo "$(m 'Your password is needed to read root-owned files (saved Wi-Fi networks).' 'Se necesita tu contraseña para leer archivos de root (redes Wi-Fi guardadas).')"
@@ -143,8 +144,24 @@ cmd_backup() {
   step "$(m 'Your home folder (this takes a while)' 'Tu carpeta personal (esto tarda)')"
   local excludes=()
   for f in "${HOME_EXCLUDES[@]}"; do excludes+=(--exclude="$f"); done
-  tar --acls --xattrs "${excludes[@]}" -C "$HOME" -cpf - . \
+  # tar exits 1 when a file changes while it is read (open browser, logs): the backup is still
+  # usable. Exit 2 means some files could not be read; keep going but tell the user which.
+  local status=()
+  set +e
+  tar --acls --xattrs --warning=no-file-changed "${excludes[@]}" -C "$HOME" -cpf - . \
+      2> "$dest/home-warnings.txt" \
     | zstd -q -T0 -3 --progress -o "$dest/home.tar.zst"
+  status=("${PIPESTATUS[@]}")
+  set -e
+  if (( status[1] != 0 )); then
+    die "$(m 'Compressing your home failed (is the disk full?).' 'Falló la compresión de tu home (¿se llenó el disco?).')"
+  fi
+  if (( status[0] > 1 )); then
+    yellow "$(m 'Some files could not be read and were left out:' 'Algunos archivos no se pudieron leer y quedaron fuera:')"
+    sed 's/^/  /' "$dest/home-warnings.txt" | head -20
+    yellow "$(m "Full list: $dest/home-warnings.txt" "Lista completa: $dest/home-warnings.txt")"
+  fi
+  [[ -s $dest/home-warnings.txt ]] || rm -f "$dest/home-warnings.txt"
 
   step "$(m 'Checksums' 'Sumas de verificación')"
   ( cd "$dest" && sha256sum -- *.tar.zst *.txt > SHA256SUMS )
@@ -232,7 +249,7 @@ cmd_restore() {
   step "4/4 $(m 'System: Wi-Fi and /etc' 'Sistema: Wi-Fi y /etc')"
   if [[ -f $src/system.tar.zst ]]; then
     if confirm "$(m 'Restore saved Wi-Fi networks?' '¿Restaurar las redes Wi-Fi guardadas?')"; then
-      local patterns=()
+      local patterns=() d
       for d in "${WIFI_PATHS[@]}"; do patterns+=("$d*"); done
       zstd -dc "$src/system.tar.zst" \
         | sudo tar --acls --xattrs -C / -xpf - --wildcards "${patterns[@]}" 2>/dev/null || true
